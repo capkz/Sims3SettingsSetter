@@ -165,6 +165,7 @@
     <ClCompile Include="patches\lot_visibility_camera_patch.cpp" />
     <ClCompile Include="patches\cpu_optimization_patch_register.cpp" />
     <ClCompile Include="patches\createfileW_patch.cpp" />
+    <ClCompile Include="patches\draw_call_batching_patch.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
