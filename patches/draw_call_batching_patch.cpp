@@ -127,10 +127,8 @@ class DrawCallBatchingPatch : public OptimizationPatch {
         if (isEnabled) return true;
         lastError.clear();
 
-        if (!D3D9Hooks::Internal::IsInitialized()) {
-            return Fail("D3D9 hook system not initialized yet — will retry on next frame");
-        }
-
+        // Hook registration is always safe regardless of D3D9 init state.
+        // Hooks sit idle in the registry until the D3D9 device is ready.
         D3D9Hooks::RegisterBeginScene(HOOK_NAME,     &OnBeginScene,     D3D9Hooks::Priority::First);
         D3D9Hooks::RegisterSetPixelShader(HOOK_NAME, &OnSetPixelShader, D3D9Hooks::Priority::First);
         D3D9Hooks::RegisterSetVertexShader(HOOK_NAME,&OnSetVertexShader,D3D9Hooks::Priority::First);
