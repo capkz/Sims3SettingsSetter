@@ -167,6 +167,7 @@
     <ClCompile Include="patches\createfileW_patch.cpp" />
     <ClCompile Include="patches\draw_call_batching_patch.cpp" />
     <ClCompile Include="patches\sim_update_throttle_patch.cpp" />
+    <ClCompile Include="patches\pathfinding_cache_patch.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
