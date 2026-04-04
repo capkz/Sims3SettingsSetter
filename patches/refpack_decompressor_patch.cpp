@@ -262,10 +262,10 @@ class RefPackDecompressorPatch : public OptimizationPatch {
     // -------------------------------------------------------------------------
     // Decompression Result Cache
     //
-    // Caches decompressed data keyed by a FNV-1a hash of the first 64 compressed
-    // bytes + srcSize. When the same compressed entry is requested again (e.g. a
-    // lot reloads after streaming out), the result is served from the cache
-    // instead of re-running decompression.
+    // Caches decompressed data keyed by a FNV-1a hash of ALL compressed bytes.
+    // When the same compressed entry is requested again (e.g. a lot reloads after
+    // streaming out), the result is served from the cache instead of re-running
+    // decompression.
     //
     // Most impactful for: lot streaming in open-world play, loading a previously
     // visited lot, and worlds with heavy CC where the same assets repeat often.
@@ -287,19 +287,17 @@ class RefPackDecompressorPatch : public OptimizationPatch {
     bool s_cacheEnabled = false;
     int s_cacheMaxMB = 64;
 
-    // FNV-1a over first min(srcSize, 64) compressed bytes mixed with srcSize.
-    // Fast and collision-resistant enough for our purposes.
+    // FNV-1a over ALL compressed bytes. Hashing only a prefix caused false
+    // cache hits between LOD variants of the same mesh (same header bytes,
+    // same compressed size) which served the wrong mesh and broke sim visuals.
     static uint64_t HashKey(const uint8_t* src, uint32_t srcSize) {
         constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
         constexpr uint64_t FNV_PRIME  = 1099511628211ULL;
         uint64_t hash = FNV_OFFSET;
-        uint32_t sampleLen = srcSize < 64 ? srcSize : 64;
-        for (uint32_t i = 0; i < sampleLen; i++) {
+        for (uint32_t i = 0; i < srcSize; i++) {
             hash ^= src[i];
             hash *= FNV_PRIME;
         }
-        // Mix in the full size so different-length streams with the same prefix collide less
-        hash ^= static_cast<uint64_t>(srcSize) * FNV_PRIME;
         return hash;
     }
 
@@ -460,5 +458,5 @@ REGISTER_PATCH(RefPackDecompressorPatch, {.displayName = "RefPack Decompressor O
                                              .supportedVersions = VERSION_ALL,
                                              .technicalDetails = {"Replaces original RefPack decompressor entirely", "AVX2 path for modern CPUs, SSE2 fallback for older ones",
                                                  "Optional LRU decompression cache: serves repeated asset loads (lot streaming, revisited lots) from memory instead of re-decompressing",
-                                                 "Cache key: FNV-1a of first 64 compressed bytes + size. LRU eviction when over memory budget",
+                                                 "Cache key: FNV-1a of full compressed data. LRU eviction when over memory budget",
                                                  "Optimizes quite a significant amount, probably one of the most impactful patches", "Essentially decompression/reading .package files big faster now yes :D yipeee"}})
