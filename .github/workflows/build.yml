@@ -35,7 +35,7 @@ jobs:
         shell: pwsh
 
       - name: Build Release
-        run: msbuild Sims3SettingsSetter.sln /p:Configuration=Release /p:Platform=Win32 /m /nologo
+        run: msbuild Sims3SettingsSetter.sln /p:Configuration=Release /p:Platform=x86 /m /nologo
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
