@@ -10,6 +10,9 @@ jobs:
   build:
     runs-on: windows-latest
 
+    permissions:
+      contents: write  # needed to create/update releases
+
     steps:
       - uses: actions/checkout@v4
 
@@ -47,3 +50,25 @@ jobs:
           name: Sims3SettingsSetter-${{ github.sha }}
           path: Release\Sims3SettingsSetter.asi
           if-no-files-found: error
+
+      # Only publish a release on pushes to main (not PRs, not other branches)
+      - name: Publish to GitHub Releases
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $date = Get-Date -Format "yyyy-MM-dd"
+          $tag = "dev-$date-$sha"
+          $notes = "Automated build from commit ${{ github.sha }}`n`nhttps://github.com/${{ github.repository }}/commit/${{ github.sha }}"
+
+          # Delete the rolling 'latest-dev' tag/release if it exists, then recreate
+          gh release delete latest-dev --yes 2>$null; $true
+          git push origin :refs/tags/latest-dev 2>$null; $true
+
+          gh release create latest-dev `
+            --title "Latest Dev Build ($date)" `
+            --notes $notes `
+            --prerelease `
+            Release\Sims3SettingsSetter.asi
+        shell: pwsh
