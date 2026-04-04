@@ -28,6 +28,10 @@ jobs:
           restore-keys: |
             vcpkg-x86-windows-static-
 
+      - name: Restore NuGet packages
+        run: nuget restore Sims3SettingsSetter.sln
+        shell: pwsh
+
       - name: Install vcpkg dependencies
         if: steps.vcpkg-cache.outputs.cache-hit != 'true'
         run: |
