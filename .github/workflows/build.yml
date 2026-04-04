@@ -1,0 +1,45 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # Cache the installed vcpkg packages — keyed on vcpkg.json so the cache
+      # busts whenever dependencies change. The triplet is part of the key so
+      # adding other triplets later doesn't collide.
+      - name: Cache vcpkg packages
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-x86-windows-static-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-x86-windows-static-
+
+      - name: Install vcpkg dependencies
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet=x86-windows-static
+        shell: pwsh
+
+      - name: Build Release
+        run: msbuild Sims3SettingsSetter.sln /p:Configuration=Release /p:Platform=Win32 /m /nologo
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sims3SettingsSetter-${{ github.sha }}
+          path: Release\Sims3SettingsSetter.asi
+          if-no-files-found: error

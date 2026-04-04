@@ -46,7 +46,7 @@ ipch/
 *.ilk
 *.exe
 *.dll
-.*/
+.vs/
 .tmp*
 
 # vcpkg dependencies (managed by vcpkg.json)
