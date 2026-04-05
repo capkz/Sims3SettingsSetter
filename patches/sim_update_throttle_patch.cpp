@@ -72,18 +72,26 @@ class SimUpdateThrottlePatch : public OptimizationPatch {
     static constexpr uint32_t STATIONARY_SETTLE_FRAMES = 30; // ~0.5s at 60fps
 
     // Settings
-    int s_throttleNMoving     = 2; // throttle when camera is moving (or camera-aware disabled)
-    int s_throttleNStationary = 4; // throttle when camera has been stationary for settle frames
-    bool s_cameraAwareEnabled = true;
+    int  s_throttleNMoving     = 2; // throttle when camera is moving (or camera-aware disabled)
+    int  s_throttleNStationary = 4; // throttle when camera has been stationary for settle frames
+    bool s_cameraAwareEnabled  = true;
+    int  s_frameBudgetMs       = 20; // frame time threshold (ms) to trigger overload throttle
+    bool s_frameBudgetEnabled  = true;
 
     // Camera tracking — written by Present hook, read by WorldManager hook
     // D3DTS_VIEW matrix row 3 (translation) is columns [12],[13],[14]
     static inline float s_lastCamX = 0.0f;
     static inline float s_lastCamY = 0.0f;
     static inline float s_lastCamZ = 0.0f;
-    static inline std::atomic<bool>  s_cameraMoving{true};
+    static inline std::atomic<bool>     s_cameraMoving{true};
     static inline std::atomic<uint32_t> s_stationaryFrames{0};
     static constexpr float CAM_MOVE_EPSILON = 0.01f; // units; ~1cm
+
+    // Frame time budget tracking — written by Present hook
+    static inline std::atomic<bool>   s_frameOverloaded{false};
+    static inline LARGE_INTEGER        s_lastPresentTime{};
+    static inline LARGE_INTEGER        s_qpcFreq{};
+    static inline std::atomic<uint32_t> s_lastFrameMs{0};
 
     // Frame counter
     static inline std::atomic<uint32_t> s_frameCounter{0};
@@ -99,21 +107,36 @@ class SimUpdateThrottlePatch : public OptimizationPatch {
 
     static SimUpdateThrottlePatch* instance;
 
-    // ---- Camera sampling via D3D9 Present ----
+    // ---- Camera sampling + frame time budget via D3D9 Present ----
     static D3D9Hooks::HookResult OnPresent(D3D9Hooks::DeviceContext& ctx,
                                             const RECT*, const RECT*, HWND, const RGNDATA*) {
-        if (!instance || !instance->s_cameraAwareEnabled) return D3D9Hooks::HookResult::Continue;
+        if (!instance) return D3D9Hooks::HookResult::Continue;
+
+        // --- Frame time measurement (for Speed 3 / overload detection) ---
+        if (instance->s_frameBudgetEnabled) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+
+            if (s_lastPresentTime.QuadPart != 0 && s_qpcFreq.QuadPart > 0) {
+                uint64_t elapsed = (uint64_t)(now.QuadPart - s_lastPresentTime.QuadPart);
+                uint32_t ms = (uint32_t)(elapsed * 1000ULL / (uint64_t)s_qpcFreq.QuadPart);
+                s_lastFrameMs.store(ms, std::memory_order_relaxed);
+
+                bool overloaded = (ms > (uint32_t)instance->s_frameBudgetMs);
+                s_frameOverloaded.store(overloaded, std::memory_order_relaxed);
+            }
+            s_lastPresentTime = now;
+        }
+
+        // --- Camera movement detection ---
+        if (!instance->s_cameraAwareEnabled) return D3D9Hooks::HookResult::Continue;
 
         D3DMATRIX view{};
         HRESULT hr = ctx.device->GetTransform(D3DTS_VIEW, &view);
         if (FAILED(hr)) return D3D9Hooks::HookResult::Continue;
 
-        // The view matrix is the inverse of the camera world matrix.
-        // The camera's world-space position is in the last column of the INVERSE,
-        // but D3D stores row-major, so position is recoverable via:
-        //   camPos = -(R^T * T) where T is _41,_42,_43 of view and R is the rotation part.
-        // For movement detection we only need to know if any translation component changed,
-        // so we compare _41, _42, _43 directly (they change when camera moves).
+        // For movement detection: compare _41, _42, _43 (translation component of view matrix).
+        // These change whenever the camera position changes.
         float cx = view._41;
         float cy = view._42;
         float cz = view._43;
@@ -149,9 +172,14 @@ class SimUpdateThrottlePatch : public OptimizationPatch {
         uint32_t frame = s_frameCounter.fetch_add(1, std::memory_order_relaxed);
         s_framesTotal.fetch_add(1, std::memory_order_relaxed);
 
-        // Pick throttle N: higher (more skipping) when camera is stationary
+        // Pick throttle N:
+        //   - Frame overloaded (last frame > budget_ms):  use stationary N (highest)
+        //   - Camera stationary (settled for STATIONARY_SETTLE_FRAMES): use stationary N
+        //   - Camera moving: use moving N
         int throttleN = instance->s_throttleNMoving;
-        if (instance->s_cameraAwareEnabled && !s_cameraMoving.load(std::memory_order_relaxed)) {
+        bool overloaded   = instance->s_frameBudgetEnabled && s_frameOverloaded.load(std::memory_order_relaxed);
+        bool camStationary = instance->s_cameraAwareEnabled && !s_cameraMoving.load(std::memory_order_relaxed);
+        if (overloaded || camStationary) {
             throttleN = instance->s_throttleNStationary;
         }
 
@@ -203,6 +231,17 @@ class SimUpdateThrottlePatch : public OptimizationPatch {
         RegisterBoolSetting(&s_cameraAwareEnabled, "cameraAwareEnabled", true,
             "Automatically use a higher throttle when the camera is stationary and a lower one when moving. "
             "When disabled, only the moving throttle value is used at all times.");
+
+        RegisterBoolSetting(&s_frameBudgetEnabled, "frameBudgetEnabled", true,
+            "Automatically increase lot streaming throttle when the last rendered frame took longer than the budget. "
+            "Prevents lot streaming from hogging CPU during Speed 3 or heavy simulation loads.");
+
+        RegisterIntSetting(&s_frameBudgetMs, "frameBudgetMs", 20, 8, 100,
+            "Frame time budget in milliseconds. When the last frame took longer than this, "
+            "lot streaming switches to the stationary throttle N. Default: 20ms (~50fps threshold).",
+            {{"8ms (120fps)", 8}, {"12ms (83fps)", 12}, {"16ms (60fps)", 16},
+             {"20ms (50fps, recommended)", 20}, {"33ms (30fps)", 33}},
+            SettingUIType::Slider);
     }
 
     ~SimUpdateThrottlePatch() override { instance = nullptr; }
@@ -230,6 +269,10 @@ class SimUpdateThrottlePatch : public OptimizationPatch {
         s_framesTotal.store(0, std::memory_order_relaxed);
         s_cameraMoving.store(true, std::memory_order_relaxed);
         s_stationaryFrames.store(0, std::memory_order_relaxed);
+        s_frameOverloaded.store(false, std::memory_order_relaxed);
+        s_lastPresentTime = {};
+        s_lastFrameMs.store(0, std::memory_order_relaxed);
+        QueryPerformanceFrequency(&s_qpcFreq);
 
         isEnabled = true;
         LOG_INFO(std::format("[SimUpdateThrottle] Installed — camera-aware={}, moving={}, stationary={}",
@@ -265,13 +308,21 @@ class SimUpdateThrottlePatch : public OptimizationPatch {
             bool moving = s_cameraMoving.load(std::memory_order_relaxed);
             uint32_t idle = s_stationaryFrames.load(std::memory_order_relaxed);
 
+            bool overloaded = s_frameOverloaded.load(std::memory_order_relaxed);
+            uint32_t lastFrameMs = s_lastFrameMs.load(std::memory_order_relaxed);
+
             ImGui::Separator();
             if (s_cameraAwareEnabled) {
                 ImGui::Text("Camera: %s  (idle %u frames)",
                     moving ? "Moving" : "Stationary", idle);
-                ImGui::Text("Active throttle N: %d",
-                    moving ? s_throttleNMoving : s_throttleNStationary);
             }
+            if (s_frameBudgetEnabled) {
+                ImGui::Text("Last frame: %u ms  Budget: %d ms  %s",
+                    lastFrameMs, s_frameBudgetMs, overloaded ? "[OVERLOADED]" : "");
+            }
+            ImGui::Text("Active throttle N: %d  (moving=%d  stationary=%d)",
+                (overloaded || (!moving && s_cameraAwareEnabled)) ? s_throttleNStationary : s_throttleNMoving,
+                s_throttleNMoving, s_throttleNStationary);
             ImGui::Text("Lot streaming throttled: %llu / %llu frames  (%.1f%%)", throttled, total, rate);
             ImGui::TextDisabled("Sim/household AI runs independently and is unaffected.");
 
@@ -287,15 +338,16 @@ SimUpdateThrottlePatch* SimUpdateThrottlePatch::instance = nullptr;
 
 REGISTER_PATCH(SimUpdateThrottlePatch, {
     .displayName = "Lot Streaming Update Throttle",
-    .description = "Reduces lot streaming update frequency to every N frames. Camera-aware mode uses a higher "
-                   "throttle when the camera is stationary and a lower one when the camera is moving, giving "
-                   "better responsiveness without wasting cycles when the view isn't changing.",
+    .description = "Reduces lot streaming update frequency to every N frames. Camera-aware mode increases "
+                   "throttle when the camera is stationary. Frame budget mode increases throttle when frames "
+                   "take longer than the target (Speed 3 / heavy simulation overload protection).",
     .category = "Performance",
     .experimental = true,
     .supportedVersions = VERSION_ALL,
     .technicalDetails = {
         "Hooks WorldManager::Update and asserts the lot-skip flag on throttled frames",
         "Camera movement detected by sampling D3DTS_VIEW via Present hook — no game RE required",
+        "Frame budget mode: measures frame time via QPC at Present; overload trips stationary throttle",
         "Stationary throttle N=4 by default; moving throttle N=2; settle time ~30 frames",
         "Mono script simulation (sims, households, NRAAS) runs independently — not throttled",
         "Co-exists correctly with Map View Lot Blocker via Detours hook chaining",
