@@ -246,6 +246,43 @@ print(f"\n  Compressor candidate functions: {[hex(f) for f in comp_funcs]}")
 for func in list(comp_funcs)[:3]:
     show(func, n=20, label=f"candidate {hex(func)}")
 
+# Deep dive: look at functions near the decompressor (within ±0x2000)
+# The compressor is almost always compiled adjacent to the decompressor.
+print("\n  Deep scan: functions near decompressor (±0x4000):")
+decomp_va = (scan(DECOMP_PAT) or [None])[0]
+if decomp_va:
+    # Scan for all function prologues in range
+    for off in range(max(0, decomp_va - TEXT_VA - 0x4000),
+                     min(len(TEXT_DATA)-4, decomp_va - TEXT_VA + 0x4000)):
+        va = TEXT_VA + off
+        if va == decomp_va:
+            continue
+        chunk = bytes(TEXT_DATA[off:off+4])
+        # Check for function start preceded by gap byte
+        gap = TEXT_DATA[off-1] if off > 0 else 0
+        if gap not in (0xCC, 0x90, 0xC3, 0x00):
+            continue
+        # Must look like a function prologue
+        is_prologue = (
+            (chunk[0] == 0x55 and chunk[1] == 0x8B and chunk[2] == 0xEC) or  # push ebp; mov ebp,esp
+            (chunk[0] == 0x83 and chunk[1] == 0xEC) or                         # sub esp,N
+            (chunk[0] == 0x56 and chunk[1] == 0x8B and chunk[2] == 0xF1) or  # push esi; mov esi,ecx
+            (chunk[0] == 0x53 and chunk[1] == 0x55 and chunk[2] == 0x56)      # push ebx/ebp/esi
+        )
+        if not is_prologue:
+            continue
+        # Look for 0x10 0xFB writes in this function (up to 512 bytes)
+        func_bytes = bytes(TEXT_DATA[off:off+512])
+        # Check for the byte 0xFB appearing in this function
+        if 0xFB in func_bytes and 0x10 in func_bytes:
+            # Also check for a loop (JMP backward or LOOP instruction)
+            has_loop = any(func_bytes[i] in (0xEB, 0xE9, 0xE2) and
+                          func_bytes[i+1] < 0x80  # relative jump backward: would be > 0x80
+                          or func_bytes[i] in (0xEB,) and func_bytes[i+1] > 0x80
+                          for i in range(min(400, len(func_bytes)-2)))
+            print(f"    Near-decompressor func at {hex(va)} — has 0x10 and 0xFB bytes, loop={has_loop}")
+            show(va, n=12, label=f"near-decomp func {hex(va)}")
+
 # ===========================================================================
 # 3. WORLDMANAGER::UPDATE — verify EA address
 # ===========================================================================
@@ -318,14 +355,17 @@ print("=" * 72)
 # A vtable-call loop: mov eax,[edi/esi]; call [eax+offset]
 # with surrounding loop structure (compare + add/inc pointer)
 obj_patterns = [
-    "8B 07 8B CF FF 50 ??",    # mov eax,[edi]; mov ecx,edi; call [eax+N]
-    "8B 06 8B CE FF 50 ??",    # mov eax,[esi]; mov ecx,esi; call [eax+N]
-    "8B 10 8B CA FF 52 ??",    # mov edx,[eax]; mov ecx,edx; call [edx+N]
-    "8B 0B FF 51 ??",          # mov ecx,[ebx]; call [ecx+N]  (walk linked list)
-    "8B 08 FF 51 ??",          # mov ecx,[eax]; call [ecx+N]
-    # Update loops often have: add edi,4 or add esi,4 between calls (pointer advance)
-    "FF 50 ?? 83 C? 04",       # call [eax+N]; add reg,4
-    "FF 51 ?? 83 C? 04",       # call [ecx+N]; add reg,4
+    "8B 07 8B CF FF 50 ?? 83 C7 04",   # mov eax,[edi]; mov ecx,edi; call [eax+N]; add edi,4
+    "8B 06 8B CE FF 50 ?? 83 C6 04",   # mov eax,[esi]; mov ecx,esi; call [eax+N]; add esi,4
+    "8B 07 8B CF FF 50 ??",            # mov eax,[edi]; mov ecx,edi; call [eax+N]
+    "8B 06 8B CE FF 50 ??",            # mov eax,[esi]; mov ecx,esi; call [eax+N]
+    "8B 10 8B CA FF 52 ??",            # mov edx,[eax]; mov ecx,eax; call [edx+N]
+    "8B 0B FF 51 ??",                  # mov ecx,[ebx]; call [ecx+N]
+    "8B 08 FF 51 ??",                  # mov ecx,[eax]; call [ecx+N]
+    "FF 50 ?? 83 C7 04",               # call [eax+N]; add edi,4
+    "FF 50 ?? 83 C6 04",               # call [eax+N]; add esi,4
+    "FF 51 ?? 83 C7 04",               # call [ecx+N]; add edi,4
+    "FF 51 ?? 83 C6 04",               # call [ecx+N]; add esi,4
 ]
 
 print("  Scanning for vtable call loop patterns:")

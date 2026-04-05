@@ -73,73 +73,28 @@ class AddressScannerPatch : public OptimizationPatch {
             // ---- NEW addresses to find ----
             {
                 "RefPack Compressor",
-                // The compressor writes header byte 0x10 then 0xFB then 3-byte size.
-                // Pattern: the 3-byte big-endian size write sequence after the header.
-                // After writing 0x10 0xFB, it writes (srcSize >> 16), (srcSize >> 8), (srcSize & 0xFF).
-                // Typical MSVC codegen for this:
-                //   mov [dst+2], al  (low byte of high word)
-                //   mov [dst+3], cl  (etc)
-                // We look for the unique combination of:
-                //   PUSH of output buffer pointer + header bytes near a compact loop.
-                // Alternative: scan for the function that calls the decompressor (crossref).
-                // For now: look for function that writes 0xFB byte immediately after 0x10 byte.
-                // C6 4? 01 FB = MOV byte [reg+1], 0xFB  (second header byte, offset 1)
-                "C6 4? 01 FB",
-                SCAN_BACK,
-                "Compressor: writes RefPack magic byte 0xFB at output[1]"
+                // Confirmed via binary analysis of ts3Worig.exe (Steam build):
+                // Function at 0x4ec0a0 — prologue checks srcSize against 0x4000
+                // (small-file threshold for 3-byte vs 4-byte header), then stores
+                // the 0x10FB RefPack magic constant to a local variable.
+                // Pattern: push ebp; mov ebp,esp; sub esp,10h; mov eax,[ebp+14h];
+                //          push ebx; cmp eax,4000h  ← unique to this function
+                "55 8B EC 83 EC 10 8B 45 14 53 3D 00 40 00 00",
+                0,
+                "Steam: 0x4ec0a0 (confirmed). Prologue + cmp srcSize,0x4000"
             },
             {
-                "RefPack Compressor (alt: C6 46 01 FB)",
-                "C6 46 01 FB",
-                SCAN_BACK,
-                "MOV [esi+1], 0xFB — compressor header write via esi"
-            },
-            {
-                "RefPack Compressor (alt: C6 47 01 FB)",
-                "C6 47 01 FB",
-                SCAN_BACK,
-                "MOV [edi+1], 0xFB — compressor header write via edi"
-            },
-            {
-                "RefPack Compressor (alt: 88 5? 01)",
-                // Store the 0xFB byte: MOV [reg+1], bl/bh when bl=0xFB
-                // This is trickier. Look for: CMP against 0xFB10 magic
-                "81 ?? FB 10 00 00",
-                SCAN_BACK,
-                "CMP reg, 0x000010FB — header validation in compressor or decompressor"
-            },
-            {
-                "IResourceManager::GetResource",
-                // The resource lookup function iterates package list, comparing ResourceKey.
-                // ResourceKey = {uint32 typeId, uint32 groupId, uint64 instanceId}.
-                // A quadruple CMP+JNZ sequence is distinctive.
-                // 3B 46 00 = CMP EAX, [ESI+0]  (typeId compare, offset 0)
-                // 75 ??    = JNZ skip
-                // 3B 4E 04 = CMP ECX, [ESI+4]  (groupId compare, offset 4)
-                // 75 ??    = JNZ skip
-                "3B 46 00 75 ?? 3B 4E 04 75",
-                SCAN_BACK,
-                "ResourceKey quad-compare: cmp typeId, jnz, cmp groupId, jnz"
-            },
-            {
-                "IResourceManager::GetResource (alt1)",
-                "3B 47 00 75 ?? 3B 4F 04 75",
-                SCAN_BACK,
-                "ResourceKey compare via edi"
-            },
-            {
-                "IResourceManager::GetResource (alt2)",
-                // Compare all 16 bytes via REPE CMPSD (REP compare dword)
-                "F3 A7",
-                SCAN_BACK,
-                "REPE CMPSD — block comparison (may be ResourceKey or other struct)"
-            },
-            {
-                "IResourceManager::GetResource (alt3)",
-                // Another form: load typeId into eax, compare, branch
-                "8B 46 00 3B 46 ?? 75 ?? 8B 4E 04 3B",
-                SCAN_BACK,
-                "Load typeId + double CMP pattern"
+                "IResourceManager::GetResource (sorted container find)",
+                // Confirmed via binary analysis: the resource manager uses a sorted container
+                // (std::map / red-black tree). The find function at 0x81ccd0 (Steam) performs
+                // a key comparison then calls 0x626aa0 (lower_bound).
+                // Pattern: movzx eax,byte[ecx+10h]; push esi; mov esi,[ecx+4]; mov ecx,[ecx];
+                //          push edi; mov edi,[esp+0Ch]; push eax; push edi; push esi; push ecx;
+                //          call <lower_bound>
+                // Unique prologue: movzx eax, byte ptr [ecx+0x10]
+                "0F B6 41 10 56 8B 71 04 8B 09 57 8B 7C 24 0C 50 57 56 51",
+                0,
+                "Steam: 0x81ccd0 (confirmed). IResourceManager sorted-container find."
             },
             {
                 "ObjectManager::UpdateAll",

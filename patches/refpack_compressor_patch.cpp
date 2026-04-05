@@ -48,15 +48,18 @@ class RefPackCompressorPatch : public OptimizationPatch {
         .name = "RefPackCompressor::hookAddr",
         .addresses =
             {
-                // TBD: fill in after binary verification
-                // Retail: near 0x004eb900 (decompressor); compressor likely ±0x800
-                // Steam:  near 0x004eb3b0
-                // EA:     near 0x004eb4f0
+                // Steam 1.67: confirmed via ts3Worig.exe binary analysis.
+                // Function prologue: push ebp; mov ebp,esp; sub esp,10h;
+                //   mov eax,[ebp+14h]; push ebx; cmp eax,4000h; setle cl;
+                //   cmp eax,1000000h; ... mov [ebp-0Ch],10FBh   ← RefPack magic
+                {GameVersion::Steam, 0x004ec0a0},
+                // Retail/EA: use pattern scan (addresses TBD — runtime scanner will find them)
             },
-        // Pattern for the compressor function prologue — writing the RefPack 0x10FB header
-        // and checking srcSize. Adjust after verifying with IDA/Ghidra.
-        .pattern = "83 EC ?? 53 55 56 57 8B 7C 24 ?? 8B 6C 24 ?? 85 FF 0F 84",
-        .expectedBytes = {0x83, 0xEC},
+        // Unique prologue: sub esp,10h + srcSize load + cmp 0x4000 (small-file threshold)
+        // followed within ~40 bytes by the 0x10FB magic constant assignment.
+        // This combination is unique to the RefPack compressor entry point.
+        .pattern = "55 8B EC 83 EC 10 8B 45 14 53 3D 00 40 00 00",
+        .expectedBytes = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x10},
     };
 
     std::vector<PatchHelper::PatchLocation> patchedLocations;
@@ -338,10 +341,10 @@ class RefPackCompressorPatch : public OptimizationPatch {
         auto addr = refPackCompressor.Resolve();
         if (!addr) {
             return Fail(
-                "RefPack compressor address not yet verified. "
-                "Pattern scan failed — addresses need binary RE (IDA/Ghidra). "
-                "Decompressor is at Retail:0x004eb900 / Steam:0x004eb3b0 / EA:0x004eb4f0; "
-                "compressor should be within ±0x2000 of those addresses.");
+                "RefPack compressor address not found. "
+                "Steam address (0x4ec0a0) confirmed via binary analysis. "
+                "For Retail/EA: enable the Address Scanner patch and click Scan Now. "
+                "Pattern: '55 8B EC 83 EC 10 8B 45 14 53 3D 00 40 00 00'");
         }
 
         if (!PatchHelper::WriteRelativeJump(*addr,
