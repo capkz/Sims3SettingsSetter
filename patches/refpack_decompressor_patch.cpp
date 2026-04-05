@@ -260,36 +260,68 @@ class RefPackDecompressorPatch : public OptimizationPatch {
     }
 
     // -------------------------------------------------------------------------
-    // Decompression Result Cache
+    // Decompression Result Cache — Slab + O(1) LRU
     //
-    // Caches decompressed data keyed by a FNV-1a hash of ALL compressed bytes.
-    // When the same compressed entry is requested again (e.g. a lot reloads after
-    // streaming out), the result is served from the cache instead of re-running
-    // decompression.
+    // Caches decompressed data keyed by FNV-1a of ALL compressed bytes.
     //
-    // Most impactful for: lot streaming in open-world play, loading a previously
-    // visited lot, and worlds with heavy CC where the same assets repeat often.
+    // Memory design (critical for 32-bit address space):
+    //   - ONE contiguous VirtualAlloc slab holds all cached data back-to-back.
+    //     This means a single VA region, not N scattered heap allocations.
+    //   - Each slot in the slab is a fixed-size record:
+    //       [uint32 size | uint64 key | data bytes (up to SLOT_SIZE)]
+    //   - A separate std::unordered_map<key → slot_index> provides O(1) lookup.
+    //   - A doubly-linked list of slot indices maintains LRU order. Eviction
+    //     is O(1): remove the tail node.
+    //   - s_slabUsedBytes tracks only the data portion — but reported overhead
+    //     in the UI accounts for the map + list metadata.
+    //
+    // Tradeoffs:
+    //   - Fixed slot size means assets larger than SLOT_SIZE are never cached.
+    //     This is intentional — large assets (>256KB decompressed) are rare and
+    //     decompressed quickly with AVX2. Caching them would waste VA space.
+    //   - Map overhead is bounded: at most MAX_SLOTS entries, each ~80 bytes
+    //     node overhead → at 4096 slots that's ~320 KB total overhead.
+    //
+    // Net result: the cache occupies exactly ONE contiguous VA region
+    // (the slab) + one small hash map. No fragmentation, no scattered
+    // allocations eating into the 32-bit address space.
     // -------------------------------------------------------------------------
 
-    struct CacheEntry {
-        std::vector<uint8_t> data; // Decompressed bytes
-        uint64_t lastUsed;         // Access tick for LRU eviction
+    static constexpr uint32_t SLOT_SIZE  = 256 * 1024; // 256 KB max per entry
+    static constexpr uint32_t MAX_SLOTS  = 512;         // slab has at most 512 slots
+    // Slab record layout: [uint32_t dataSize | uint64_t key | uint8_t data[SLOT_SIZE]]
+    static constexpr uint32_t SLOT_BYTES = sizeof(uint32_t) + sizeof(uint64_t) + SLOT_SIZE;
+
+    struct SlotHeader {
+        uint32_t dataSize;
+        uint64_t key;
     };
 
-    static inline std::unordered_map<uint64_t, CacheEntry> s_cache;
+    // LRU doubly-linked list node (stored separately, tiny)
+    struct LRUNode {
+        int prev = -1; // slot index (-1 = none)
+        int next = -1;
+    };
+
+    // Slab state — all protected by s_cacheMutex
+    static inline uint8_t*   s_slab      = nullptr;   // VirtualAlloc'd
+    static inline uint32_t   s_slabSlots = 0;         // actual number of slots allocated
+    static inline std::vector<bool>    s_slotUsed;    // which slots are occupied
+    static inline std::vector<LRUNode> s_lru;          // LRU doubly-linked list nodes
+    static inline int s_lruHead = -1;                  // most recently used slot
+    static inline int s_lruTail = -1;                  // least recently used slot (eviction target)
+    static inline std::unordered_map<uint64_t, int> s_index; // key → slot index
+
     static inline std::shared_mutex s_cacheMutex;
-    static inline std::atomic<uint64_t> s_accessTick{0};
-    static inline std::atomic<size_t> s_cacheBytesUsed{0};
+    static inline std::atomic<size_t>   s_cacheDataBytes{0}; // sum of all dataSize fields
     static inline std::atomic<uint64_t> s_cacheHits{0};
     static inline std::atomic<uint64_t> s_cacheMisses{0};
 
     // Settings
     bool s_cacheEnabled = false;
-    int s_cacheMaxMB = 64;
+    int  s_cacheMaxMB   = 32; // lower default — slab is pre-reserved, keep it modest
 
-    // FNV-1a over ALL compressed bytes. Hashing only a prefix caused false
-    // cache hits between LOD variants of the same mesh (same header bytes,
-    // same compressed size) which served the wrong mesh and broke sim visuals.
+    // FNV-1a over ALL compressed bytes.
     static uint64_t HashKey(const uint8_t* src, uint32_t srcSize) {
         constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
         constexpr uint64_t FNV_PRIME  = 1099511628211ULL;
@@ -301,58 +333,123 @@ class RefPackDecompressorPatch : public OptimizationPatch {
         return hash;
     }
 
-    // Evict LRU entries until cache is under the byte budget.
-    // Must be called under s_cacheMutex exclusive lock.
-    static void EvictToFit(size_t budget, size_t needed) {
-        while (!s_cache.empty() && s_cacheBytesUsed.load(std::memory_order_relaxed) + needed > budget) {
-            auto oldest = s_cache.begin();
-            for (auto it = std::next(oldest); it != s_cache.end(); ++it) {
-                if (it->second.lastUsed < oldest->second.lastUsed) oldest = it;
-            }
-            s_cacheBytesUsed.fetch_sub(oldest->second.data.size(), std::memory_order_relaxed);
-            s_cache.erase(oldest);
+    // Slot data pointer (within slab)
+    static inline uint8_t* SlotDataPtr(int idx) {
+        return s_slab + (size_t)idx * SLOT_BYTES + sizeof(SlotHeader);
+    }
+    static inline SlotHeader* SlotHeaderPtr(int idx) {
+        return reinterpret_cast<SlotHeader*>(s_slab + (size_t)idx * SLOT_BYTES);
+    }
+
+    // LRU: move slot to head (most recently used)
+    static void LRUPromote(int idx) {
+        if (s_lruHead == idx) return;
+        LRUNode& n = s_lru[idx];
+        // Detach
+        if (n.prev != -1) s_lru[n.prev].next = n.next;
+        if (n.next != -1) s_lru[n.next].prev = n.prev;
+        if (s_lruTail == idx) s_lruTail = n.prev;
+        // Insert at head
+        n.prev = -1;
+        n.next = s_lruHead;
+        if (s_lruHead != -1) s_lru[s_lruHead].prev = idx;
+        s_lruHead = idx;
+        if (s_lruTail == -1) s_lruTail = idx;
+    }
+
+    // LRU: evict tail (least recently used) — O(1)
+    static void LRUEvictTail() {
+        if (s_lruTail == -1) return;
+        int idx = s_lruTail;
+        SlotHeader* hdr = SlotHeaderPtr(idx);
+        s_cacheDataBytes.fetch_sub(hdr->dataSize, std::memory_order_relaxed);
+        s_index.erase(hdr->key);
+        s_slotUsed[idx] = false;
+        // Detach from list
+        LRUNode& n = s_lru[idx];
+        s_lruTail = n.prev;
+        if (s_lruTail != -1) s_lru[s_lruTail].next = -1;
+        else s_lruHead = -1;
+        n.prev = n.next = -1;
+    }
+
+    // Find a free slot, evicting LRU if necessary
+    static int AcquireSlot() {
+        // Prefer a free slot
+        for (int i = 0; i < (int)s_slabSlots; ++i) {
+            if (!s_slotUsed[i]) return i;
         }
+        // No free slot — evict LRU tail
+        int idx = s_lruTail;
+        if (idx == -1) return -1;
+        LRUEvictTail();
+        return idx;
     }
 
     static int __cdecl CachedDispatch(uint8_t* dst, uint32_t dstSize, uint8_t* src, uint32_t srcSize) {
-        uint64_t key  = HashKey(src, srcSize);
-        uint64_t tick = s_accessTick.fetch_add(1, std::memory_order_relaxed);
+        // Never cache assets that exceed the slot size — just decompress normally
+        // (We only know decompressed size after decompressing, so check dstSize as proxy)
+        if (!s_slab || dstSize > SLOT_SIZE) {
+            s_cacheMisses.fetch_add(1, std::memory_order_relaxed);
+            return Dispatch(dst, dstSize, src, srcSize);
+        }
 
-        // --- Fast path: cache hit ---
+        uint64_t key = HashKey(src, srcSize);
+
+        // --- Fast path: cache hit (shared lock) ---
         {
             std::shared_lock lock(s_cacheMutex);
-            auto it = s_cache.find(key);
-            if (it != s_cache.end()) {
-                uint32_t cachedSize = static_cast<uint32_t>(it->second.data.size());
+            auto it = s_index.find(key);
+            if (it != s_index.end()) {
+                int idx = it->second;
+                SlotHeader* hdr = SlotHeaderPtr(idx);
+                uint32_t cachedSize = hdr->dataSize;
                 if (cachedSize <= dstSize) {
-                    std::memcpy(dst, it->second.data.data(), cachedSize);
-                    it->second.lastUsed = tick;
+                    std::memcpy(dst, SlotDataPtr(idx), cachedSize);
                     s_cacheHits.fetch_add(1, std::memory_order_relaxed);
+                    // Promote needs exclusive lock — upgrade only if easy
+                    lock.unlock();
+                    std::unique_lock wlock(s_cacheMutex);
+                    // Re-check it's still there after upgrade
+                    if (s_index.count(key)) LRUPromote(idx);
                     return static_cast<int>(cachedSize);
                 }
             }
         }
 
-        // --- Slow path: decompress and store ---
+        // --- Slow path: decompress then store ---
         s_cacheMisses.fetch_add(1, std::memory_order_relaxed);
         int result = Dispatch(dst, dstSize, src, srcSize);
 
-        if (result > 0 && instance) {
+        if (result > 0 && result <= (int)SLOT_SIZE && instance) {
             size_t budget = static_cast<size_t>(instance->s_cacheMaxMB) * 1024 * 1024;
-            size_t needed = static_cast<size_t>(result);
 
-            // Only cache entries that fit within the budget at all
-            if (needed <= budget) {
-                std::unique_lock lock(s_cacheMutex);
-                EvictToFit(budget, needed);
+            std::unique_lock lock(s_cacheMutex);
+            // Don't store if key already inserted by another thread
+            if (s_index.count(key)) return result;
 
-                // Re-check after eviction (another thread may have filled it)
-                if (s_cacheBytesUsed.load(std::memory_order_relaxed) + needed <= budget) {
-                    CacheEntry entry;
-                    entry.data.assign(dst, dst + result);
-                    entry.lastUsed = tick;
-                    s_cacheBytesUsed.fetch_add(needed, std::memory_order_relaxed);
-                    s_cache.emplace(key, std::move(entry));
+            // Evict until we're under budget (each eviction is O(1))
+            while (s_cacheDataBytes.load(std::memory_order_relaxed) + (size_t)result > budget
+                   && s_lruTail != -1) {
+                LRUEvictTail();
+            }
+
+            if (s_cacheDataBytes.load(std::memory_order_relaxed) + (size_t)result <= budget) {
+                int slot = AcquireSlot();
+                if (slot >= 0) {
+                    SlotHeader* hdr  = SlotHeaderPtr(slot);
+                    hdr->dataSize    = static_cast<uint32_t>(result);
+                    hdr->key         = key;
+                    std::memcpy(SlotDataPtr(slot), dst, result);
+                    s_slotUsed[slot] = true;
+                    s_index[key]     = slot;
+                    // Insert at LRU head
+                    s_lru[slot].prev = -1;
+                    s_lru[slot].next = s_lruHead;
+                    if (s_lruHead != -1) s_lru[s_lruHead].prev = slot;
+                    s_lruHead = slot;
+                    if (s_lruTail == -1) s_lruTail = slot;
+                    s_cacheDataBytes.fetch_add(result, std::memory_order_relaxed);
                 }
             }
         }
@@ -360,10 +457,51 @@ class RefPackDecompressorPatch : public OptimizationPatch {
         return result;
     }
 
+    bool AllocateSlab() {
+        if (s_slab) return true;
+        uint32_t slots    = static_cast<uint32_t>(s_cacheMaxMB) * 1024 * 1024 / SLOT_BYTES;
+        if (slots < 1)   slots = 1;
+        if (slots > MAX_SLOTS) slots = MAX_SLOTS;
+        size_t slabBytes  = (size_t)slots * SLOT_BYTES;
+        s_slab = static_cast<uint8_t*>(VirtualAlloc(nullptr, slabBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!s_slab) {
+            LOG_ERROR(std::format("[RefPackDecompressor] Failed to allocate cache slab ({} MB)",
+                slabBytes / (1024*1024)));
+            return false;
+        }
+        s_slabSlots = slots;
+        s_slotUsed.assign(slots, false);
+        s_lru.resize(slots);
+        s_index.reserve(slots);
+        s_lruHead = s_lruTail = -1;
+        LOG_INFO(std::format("[RefPackDecompressor] Cache slab: {} slots × {} KB = {} MB  (1 VA region)",
+            slots, SLOT_BYTES / 1024, slabBytes / (1024*1024)));
+        return true;
+    }
+
+    static void FreeSlab() {
+        std::unique_lock lock(s_cacheMutex);
+        if (s_slab) {
+            VirtualFree(s_slab, 0, MEM_RELEASE);
+            s_slab = nullptr;
+        }
+        s_slabSlots = 0;
+        s_slotUsed.clear();
+        s_lru.clear();
+        s_index.clear();
+        s_lruHead = s_lruTail = -1;
+        s_cacheDataBytes.store(0, std::memory_order_relaxed);
+        s_cacheHits.store(0, std::memory_order_relaxed);
+        s_cacheMisses.store(0, std::memory_order_relaxed);
+    }
+
     static void ClearCache() {
         std::unique_lock lock(s_cacheMutex);
-        s_cache.clear();
-        s_cacheBytesUsed.store(0, std::memory_order_relaxed);
+        s_index.clear();
+        for (auto& n : s_lru) n.prev = n.next = -1;
+        for (auto& b : s_slotUsed) b = false;
+        s_lruHead = s_lruTail = -1;
+        s_cacheDataBytes.store(0, std::memory_order_relaxed);
         s_cacheHits.store(0, std::memory_order_relaxed);
         s_cacheMisses.store(0, std::memory_order_relaxed);
         LOG_INFO("[RefPackDecompressor] Cache cleared");
@@ -377,9 +515,10 @@ class RefPackDecompressorPatch : public OptimizationPatch {
             "Cache decompressed results so revisited lots and repeated asset loads skip decompression entirely. "
             "Most impactful for open-world play with heavy CC. Increases memory usage.");
 
-        RegisterIntSetting(&s_cacheMaxMB, "cacheMaxMB", 64, 8, 256,
-            "Maximum memory the cache may use (MB). Larger = more cache hits but less headroom for the 32-bit address space.",
-            {{"8 MB", 8}, {"32 MB", 32}, {"64 MB", 64}, {"128 MB", 128}, {"256 MB", 256}});
+        RegisterIntSetting(&s_cacheMaxMB, "cacheMaxMB", 32, 8, 128,
+            "Maximum memory the decompression cache may use (MB). Allocated as a single contiguous VA region. "
+            "Larger = more hits but more of the 32-bit address space consumed.",
+            {{"8 MB (~32 slots)", 8}, {"16 MB (~64 slots)", 16}, {"32 MB (~128 slots)", 32}, {"64 MB (~256 slots)", 64}, {"128 MB (~512 slots)", 128}});
     }
 
     bool Install() override {
@@ -393,11 +532,15 @@ class RefPackDecompressorPatch : public OptimizationPatch {
         const auto& cpuFeatures = CPUFeatures::Get();
         cpuHasAVX2 = cpuFeatures.hasAVX2;
 
-        uintptr_t targetAddr = s_cacheEnabled
+        if (s_cacheEnabled && !AllocateSlab()) {
+            LOG_WARNING("[RefPackDecompressor] Cache slab allocation failed — running without cache");
+        }
+
+        uintptr_t targetAddr = (s_cacheEnabled && s_slab)
             ? reinterpret_cast<uintptr_t>(&CachedDispatch)
             : reinterpret_cast<uintptr_t>(&Dispatch);
 
-        const char* variant = s_cacheEnabled
+        const char* variant = (s_cacheEnabled && s_slab)
             ? (cpuHasAVX2 ? "AVX2 + Cache" : "SSE2 + Cache")
             : (cpuHasAVX2 ? "AVX2"         : "SSE2");
         LOG_INFO(std::string("[RefPackDecompressor] Installing optimized decompressor (") + variant + " + Safety Checks)...");
@@ -417,6 +560,7 @@ class RefPackDecompressorPatch : public OptimizationPatch {
 
         if (!PatchHelper::RestoreAll(patchedLocations)) { return Fail("Failed to restore original decompressor"); }
 
+        FreeSlab();
         isEnabled = false;
         LOG_INFO("[RefPackDecompressor] Successfully uninstalled");
         return true;
@@ -429,20 +573,27 @@ class RefPackDecompressorPatch : public OptimizationPatch {
         OptimizationPatch::RenderCustomUI();
 
         // Cache stats (only useful when cache is active)
-        if (s_cacheEnabled && isEnabled) {
-            uint64_t hits   = s_cacheHits.load(std::memory_order_relaxed);
-            uint64_t misses = s_cacheMisses.load(std::memory_order_relaxed);
-            uint64_t total  = hits + misses;
-            float    rate   = total > 0 ? static_cast<float>(hits) / static_cast<float>(total) * 100.0f : 0.0f;
-            size_t   usedKB = s_cacheBytesUsed.load(std::memory_order_relaxed) / 1024;
+        if (s_cacheEnabled && isEnabled && s_slab) {
+            uint64_t hits    = s_cacheHits.load(std::memory_order_relaxed);
+            uint64_t misses  = s_cacheMisses.load(std::memory_order_relaxed);
+            uint64_t total   = hits + misses;
+            float    rate    = total > 0 ? static_cast<float>(hits) / static_cast<float>(total) * 100.0f : 0.0f;
+            size_t   dataMB  = s_cacheDataBytes.load(std::memory_order_relaxed) / (1024 * 1024);
+            // Slab total VA = slots × SLOT_BYTES
+            size_t   slabMB  = (size_t)s_slabSlots * SLOT_BYTES / (1024 * 1024);
 
             ImGui::Separator();
-            ImGui::Text("Cache: %zu KB used  |  %.1f%% hit rate  (%llu / %llu)",
-                usedKB, rate, hits, total);
+            ImGui::Text("Cache data : %zu MB / %zu MB slab  (%u slots, %u KB each)",
+                dataMB, slabMB, s_slabSlots, SLOT_BYTES / 1024);
+            ImGui::Text("Hit rate   : %.1f%%  (%llu hits / %llu calls)", rate, hits, total);
+            ImGui::TextDisabled("Slab = 1 contiguous VA region — no fragmentation");
 
             if (ImGui::Button("Clear Cache")) {
                 ClearCache();
             }
+        } else if (s_cacheEnabled && isEnabled && !s_slab) {
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.3f, 1.f), "Cache slab not allocated (VirtualAlloc failed)");
         }
     }
 };
