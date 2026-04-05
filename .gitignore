@@ -57,3 +57,7 @@ vcpkg_installed/
 # NuGet packages (if any legacy ones remain)
 packages/
 *.nupkg
+
+# Game binaries used for reverse engineering — not for distribution
+tools/*.exe
+tools/*.dll
