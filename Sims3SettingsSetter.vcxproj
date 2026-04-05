@@ -171,6 +171,7 @@
     <ClCompile Include="patches\refpack_compressor_patch.cpp" />
     <ClCompile Include="patches\package_index_cache_patch.cpp" />
     <ClCompile Include="patches\object_update_throttle_patch.cpp" />
+    <ClCompile Include="patches\address_scanner_patch.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
